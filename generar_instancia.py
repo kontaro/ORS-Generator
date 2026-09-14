@@ -22,10 +22,13 @@ ventanas horarias se generan a partir de distribuciones/parametros descritos
 arriba, no de datos hospitalarios privados.
 """
 
+import json
 import warnings
 import numpy as np
 import pandas as pd
 from pathlib import Path
+
+GENERATOR_VERSION = "1.2"
 
 # ---------------------------------------------------------------------------
 # 1. Especialidades en alcance (subconjunto de la taxonomia REM-07,
@@ -129,7 +132,7 @@ def pesos_especialidad_desde_datos(datos: pd.DataFrame) -> dict:
     usuario, incluyendo especialidades que no esten en la lista chilena por
     defecto."""
     conteo = datos["Especialidad"].value_counts()
-    return conteo.to_dict()
+    return {str(k): int(v) for k, v in conteo.items()}
 
 
 def _ajustar_gamma_por_especialidad(datos_empiricos: pd.DataFrame, especialidad: str,
@@ -298,31 +301,46 @@ def _sortear_bloque(rng: np.random.Generator):
     return BLOCK_TYPES[tipo]
 
 
-def generar_medicos(n_medicos_base: int, tabla_pabellones: pd.DataFrame,
-                     rng: np.random.Generator,
-                     pesos_especialidad: dict = SPECIALTY_WEIGHTS,
+def generar_medicos(tabla_pabellones: pd.DataFrame, rng: np.random.Generator,
+                     medicos_por_pabellon: float = 1.0,
                      cobertura_minima: float = 0.8,
                      max_medicos_extra_por_especialidad: int = 8) -> tuple:
-    """Genera el pool base de medicos (cada uno con un bloque estandar:
-    dia completo o medio dia AM/PM) y luego, para cada especialidad asignada
-    a algun pabellon ese dia, refuerza con medicos adicionales de esa
-    especialidad hasta que la cobertura horaria conjunta alcance
-    cobertura_minima (o el tope de seguridad)."""
-    especialidades_pool = list(pesos_especialidad.keys())
-    pesos = np.array(list(pesos_especialidad.values()), dtype=float)
-    pesos /= pesos.sum()
+    """Para CADA especialidad con al menos un pabellon asignado ese dia, la
+    base de medicos de esa especialidad es
+    ceil(medicos_por_pabellon * n_pabellones_de_esa_especialidad) - al menos
+    un medico por pabellon de esa especialidad (con medicos_por_pabellon=1.0,
+    el default), para que en principio cada pabellon de esa especialidad
+    pueda operar en paralelo con su propio equipo (ver Fei, Meskens & Chu
+    2006 sobre "block scheduling": un cirujano por pabellon por dia).
 
-    especialidad_medico = list(rng.choice(especialidades_pool, size=n_medicos_base, p=pesos))
-    inicio, fin = [], []
-    for _ in range(n_medicos_base):
-        s, e = _sortear_bloque(rng)
-        inicio.append(s)
-        fin.append(e)
+    Esto reemplaza un diseño anterior en el que la cantidad TOTAL de medicos
+    se repartia por un sorteo ponderado por especialidad, INDEPENDIENTE del
+    sorteo de especialidad de los pabellones: por azar, una especialidad
+    podia terminar con varios pabellones activos pero muy pocos medicos (o
+    viceversa), y la metrica de cobertura horaria (que solo mide UNION de
+    horarios, no capacidad simultanea) no lo detectaba - un pabellon
+    "cubierto" el 100% del dia por 2 medicos igual no alcanza para operar
+    4 pabellones de esa especialidad en paralelo.
 
-    especialidades_activas = tabla_pabellones["Especialidad"].unique()
+    Sobre esa base por pabellon, se sigue reforzando por especialidad (hasta
+    max_medicos_extra_por_especialidad) hasta alcanzar cobertura_minima
+    (fraccion del dia cubierta por AL MENOS UN medico) - esto ahora cierra
+    huecos de horario (p.ej. si por azar todos los medicos base de una
+    especialidad salieron con bloque AM), no huecos de dotacion."""
+    especialidades_activas = tabla_pabellones["Especialidad"].value_counts()
+
+    especialidad_medico, inicio, fin = [], [], []
+    for especialidad, n_pabellones_esp in especialidades_activas.items():
+        n_base_esp = max(1, int(np.ceil(medicos_por_pabellon * n_pabellones_esp)))
+        for _ in range(n_base_esp):
+            s, e = _sortear_bloque(rng)
+            especialidad_medico.append(especialidad)
+            inicio.append(s)
+            fin.append(e)
+
     reporte_cobertura = {}
 
-    for especialidad in especialidades_activas:
+    for especialidad in especialidades_activas.index:
         agregados = 0
         while agregados < max_medicos_extra_por_especialidad:
             tabla_tmp = pd.DataFrame({"Especialidad": especialidad_medico, "Inicio": inicio, "Fin": fin})
@@ -399,8 +417,23 @@ def generar_instancia(n_pabellones: int, seed: int = None,
     con tus datos), se avisa con un warning y esa especialidad puntual usa la
     Gamma global chilena. Pasa `modo_duracion_propia="auto"` para el
     comportamiento previo a estos dos modos (bootstrap solo si hay >= 5
-    observaciones, si no Gamma global)."""
+    observaciones, si no Gamma global).
+
+    Reproducibilidad
+    -----------------
+    Si `seed` es None, NO se deja la generacion sin semilla: se sortea una
+    semilla concreta (con entropia del sistema) y se usa esa, para que la
+    instancia siga siendo reproducible aunque no hayas fijado un seed a
+    mano. La semilla efectivamente usada (junto con el resto de los
+    parametros y, si corresponde, la mezcla de especialidades ya resuelta)
+    queda en `instancia["metadata"]`, y `guardar_instancia` la escribe en un
+    .json junto a los .xlsx. Usa `regenerar_desde_metadata` para reconstruir
+    exactamente la misma instancia a partir de ese .json."""
+    if seed is None:
+        seed = int(np.random.default_rng().integers(0, 2**31 - 1))
     rng = np.random.default_rng(seed)
+
+    datos_cirugias_propios_arg = datos_cirugias_propios
 
     if datos_cirugias_propios is not None and not isinstance(datos_cirugias_propios, pd.DataFrame):
         datos_cirugias_propios = cargar_datos_cirugias(datos_cirugias_propios)
@@ -432,18 +465,45 @@ def generar_instancia(n_pabellones: int, seed: int = None,
                                        modo_duracion_propia=modo_duracion_propia,
                                        prop_gamma_en_mixto=prop_gamma_en_mixto)
 
-    n_medicos_base = max(len(pesos), round(n_pabellones * medicos_por_pabellon))
     tabla_medicos, reporte_cobertura = generar_medicos(
-        n_medicos_base, tabla_pabellones, rng, pesos_especialidad=pesos,
+        tabla_pabellones, rng, medicos_por_pabellon=medicos_por_pabellon,
         cobertura_minima=cobertura_minima,
         max_medicos_extra_por_especialidad=max_medicos_extra_por_especialidad,
     )
+
+    if isinstance(datos_cirugias_propios_arg, pd.DataFrame):
+        descripcion_datos_propios = (
+            f"<DataFrame en memoria: {len(datos_cirugias_propios_arg)} filas, "
+            f"especialidades: {sorted(datos_cirugias_propios_arg['Especialidad'].unique())}> "
+            "(no se guardan los tiempos crudos en la metadata; para regenerar "
+            "esta instancia hay que volver a pasar el mismo DataFrame a mano)"
+        )
+    elif datos_cirugias_propios_arg is not None:
+        descripcion_datos_propios = str(datos_cirugias_propios_arg)
+    else:
+        descripcion_datos_propios = None
+
+    metadata = {
+        "generador_version": GENERATOR_VERSION,
+        "n_pabellones": n_pabellones,
+        "seed": seed,
+        "factor_sobredemanda": factor_sobredemanda,
+        "medicos_por_pabellon": medicos_por_pabellon,
+        "cobertura_minima": cobertura_minima,
+        "max_medicos_extra_por_especialidad": max_medicos_extra_por_especialidad,
+        "pesos_especialidad": pesos,
+        "datos_cirugias_propios": descripcion_datos_propios,
+        "usar_mezcla_de_datos_propios": usar_mezcla_de_datos_propios,
+        "modo_duracion_propia": modo_duracion_propia,
+        "prop_gamma_en_mixto": prop_gamma_en_mixto,
+    }
 
     return {
         "pabellones": tabla_pabellones,
         "cirugias": tabla_cirugias,
         "medicos": tabla_medicos,
         "reporte_cobertura": reporte_cobertura,
+        "metadata": metadata,
     }
 
 
@@ -452,6 +512,49 @@ def guardar_instancia(instancia: dict, dir_salida: Path, prefijo: str):
     instancia["pabellones"].to_excel(dir_salida / f"{prefijo}_Pabellones.xlsx", index=False)
     instancia["cirugias"].to_excel(dir_salida / f"{prefijo}_Cirugias.xlsx", index=False)
     instancia["medicos"].to_excel(dir_salida / f"{prefijo}_Medicos.xlsx", index=False)
+    if "metadata" in instancia:
+        ruta_metadata = dir_salida / f"{prefijo}_metadata.json"
+        with open(ruta_metadata, "w", encoding="utf-8") as f:
+            json.dump(instancia["metadata"], f, ensure_ascii=False, indent=2)
+
+
+def regenerar_desde_metadata(ruta_metadata) -> dict:
+    """Reconstruye exactamente la misma instancia (mismo seed y mismos
+    parametros) a partir del `{prefijo}_metadata.json` que guarda
+    guardar_instancia.
+
+    Si la instancia original recibio `datos_cirugias_propios` como un
+    DataFrame ya cargado en memoria (no como un path a archivo), la
+    metadata no guarda los tiempos crudos -para no terminar reintroduciendo
+    datos privados en un artefacto versionable como este .json-, solo un
+    resumen. En ese caso hay que volver a pasar esos mismos datos a mano via
+    el argumento `datos_cirugias_propios_override`."""
+    ruta_metadata = Path(ruta_metadata)
+    with open(ruta_metadata, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    datos_propios = meta.get("datos_cirugias_propios")
+    if isinstance(datos_propios, str) and datos_propios.startswith("<DataFrame en memoria"):
+        raise ValueError(
+            "Esta instancia se genero con datos_cirugias_propios entregados "
+            "como un DataFrame en memoria, y la metadata no guarda los datos "
+            "crudos. Vuelve a generarla llamando a generar_instancia(...) "
+            "directamente, pasando el mismo DataFrame junto con estos "
+            f"parametros: {meta}"
+        )
+
+    return generar_instancia(
+        n_pabellones=meta["n_pabellones"],
+        seed=meta["seed"],
+        factor_sobredemanda=meta["factor_sobredemanda"],
+        medicos_por_pabellon=meta["medicos_por_pabellon"],
+        cobertura_minima=meta["cobertura_minima"],
+        max_medicos_extra_por_especialidad=meta["max_medicos_extra_por_especialidad"],
+        pesos_especialidad=meta["pesos_especialidad"],
+        datos_cirugias_propios=datos_propios,
+        modo_duracion_propia=meta["modo_duracion_propia"],
+        prop_gamma_en_mixto=meta["prop_gamma_en_mixto"],
+    )
 
 
 if __name__ == "__main__":
@@ -463,7 +566,7 @@ if __name__ == "__main__":
         cirugias_por_esp = inst["cirugias"].groupby("Especialidad")["Tiempo"].agg(["count", "sum"])
         capacidad_por_esp = inst["pabellones"].groupby("Especialidad")["Disponibilidad_min"].sum()
 
-        print(f"\n--- {n_pab} pabellones ---")
+        print(f"\n--- {n_pab} pabellones (seed={inst['metadata']['seed']}) ---")
         print("pabellones por especialidad:", inst["pabellones"]["Especialidad"].value_counts().to_dict())
         print(f"cirugias candidatas: {len(inst['cirugias'])}, medicos: {len(inst['medicos'])}")
         for esp in capacidad_por_esp.index:
