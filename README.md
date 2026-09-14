@@ -82,16 +82,23 @@ Full-day blocks are weighted slightly higher than half-day blocks, reflecting
 the operational preference for full-day blocks noted in perioperative
 management practice (fewer turnovers, more consistent utilization).
 
-### 5. Specialty mix (rooms and surgeon pool)
+### 5. Specialty mix (rooms, and surgeon pool via realized room counts)
 
-The relative weight of each specialty (used both for assigning rooms to
-specialties and for populating the surgeon pool) is calibrated to be
-order-of-magnitude consistent with the national 2024 distribution of
-specialist physicians by specialty reported in:
+The relative weight of each specialty is used to assign rooms to
+specialties, calibrated to be order-of-magnitude consistent with the
+national 2024 distribution of specialist physicians by specialty reported
+in:
 
 - Arancibia-Luna, M.J., Riedemann González, J.P., Castillo Mora, J.A., &
   Huaiquilaf-Jorquera, S. (2026). *Médicos especialistas en Chile: Análisis
   de la situación 2024.* Revista Médica de Chile, 154(3), 313–324.
+
+The surgeon pool is not sampled independently from these weights; it is
+derived from the realized room count per specialty for that instance (see
+`medicos_por_pabellon` below) precisely so that the number of surgeons of a
+specialty always tracks how many rooms of that specialty actually got
+generated that day, rather than being drawn from a separate lottery that
+could by chance under- or over-staff a specialty relative to its rooms.
 
 This is a national physician-count proxy, not hospital-specific staffing
 data, and is treated as a calibration assumption rather than a precise
@@ -143,8 +150,8 @@ Key parameters of `generar_instancia`:
 |---|---|---|
 | `n_pabellones` | — | Number of operating rooms in the instance |
 | `factor_sobredemanda` | 1.5 | Ratio of candidate surgery minutes to room capacity, per specialty |
-| `medicos_por_pabellon` | 1.0 | Base surgeon pool size per room, before coverage reinforcement |
-| `cobertura_minima` | 0.8 | Minimum fraction of the day that must be covered by at least one surgeon of each active specialty |
+| `medicos_por_pabellon` | 1.0 | Base surgeon count per room, **per specialty**: each specialty active that day gets at least `ceil(medicos_por_pabellon × its own room count)` surgeons, before coverage reinforcement — so every room can in principle be staffed by its own team in parallel |
+| `cobertura_minima` | 0.8 | Minimum fraction of the day that must be covered by at least one surgeon of each active specialty (on top of the base above; this closes schedule-timing gaps, not staffing shortfalls) |
 | `max_medicos_extra_por_especialidad` | 8 | Safety cap on reinforcement surgeons added per specialty |
 
 ## Using your own data
