@@ -22,6 +22,7 @@ ventanas horarias se generan a partir de distribuciones/parametros descritos
 arriba, no de datos hospitalarios privados.
 """
 
+import warnings
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -103,11 +104,20 @@ def cargar_datos_cirugias(fuente) -> pd.DataFrame:
     else:
         fuente = Path(fuente)
         df = pd.read_csv(fuente) if fuente.suffix.lower() == ".csv" else pd.read_excel(fuente)
+
+    # 'Tiempo' se acepta como alias de 'Duracion' (es el nombre que usa la
+    # tabla de cirugias que produce este mismo generador, y con el que
+    # muchos registros hospitalarios ya vienen etiquetados).
+    if "Duracion" not in df.columns and "Tiempo" in df.columns:
+        df = df.rename(columns={"Tiempo": "Duracion"})
+
     faltantes = {"Especialidad", "Duracion"} - set(df.columns)
     if faltantes:
         raise ValueError(f"Faltan columnas {faltantes} en los datos propios. "
-                          f"Se esperan las columnas 'Especialidad' y 'Duracion'.")
+                          f"Se esperan las columnas 'Especialidad' y 'Duracion' "
+                          f"('Tiempo' tambien se acepta como nombre de la columna de duracion).")
     df = df[["Especialidad", "Duracion"]].dropna()
+    df["Especialidad"] = df["Especialidad"].astype(str)
     df["Duracion"] = df["Duracion"].astype(float)
     return df
 
@@ -122,17 +132,89 @@ def pesos_especialidad_desde_datos(datos: pd.DataFrame) -> dict:
     return conteo.to_dict()
 
 
+def _ajustar_gamma_por_especialidad(datos_empiricos: pd.DataFrame, especialidad: str,
+                                     minimo_ajuste: int = 5) -> tuple:
+    """Ajusta (por metodo de momentos, igual que el ajuste global chileno) una
+    Gamma a la media y desviacion estandar OBSERVADAS de esa especialidad en
+    datos_empiricos - es decir, adapta la forma de la Gamma a la variabilidad
+    real de ESA especialidad, en vez de reusar los parametros globales
+    (DURATION_MEAN/DURATION_SD, calibrados sobre el conjunto de 78
+    procedimientos de Meza-Vasquez et al., mezclando todas las especialidades).
+    Si hay menos de `minimo_ajuste` observaciones, o la desviacion estandar
+    observada es 0 (todas las cirugias de esa especialidad duran lo mismo),
+    se cae a los parametros globales por defecto."""
+    pool = datos_empiricos.loc[datos_empiricos["Especialidad"] == especialidad, "Duracion"].to_numpy()
+    if len(pool) >= minimo_ajuste:
+        media, sd = pool.mean(), pool.std(ddof=0)
+        if sd > 0:
+            return (media / sd) ** 2, (sd ** 2) / media
+    return _DUR_SHAPE, _DUR_SCALE
+
+
 def _muestrear_duraciones(n: int, rng: np.random.Generator, especialidad: str = None,
                            datos_empiricos: pd.DataFrame = None,
-                           minimo_bootstrap: int = 5) -> np.ndarray:
-    """Si se entregan datos_empiricos con al menos `minimo_bootstrap`
-    observaciones para esa especialidad, se remuestrea (bootstrap) desde
-    esos datos reales. En caso contrario, se usa la distribucion Gamma por
-    defecto calibrada para el sistema chileno (ver README)."""
+                           minimo_bootstrap: int = 5,
+                           modo_duracion_propia: str = "auto",
+                           prop_gamma_en_mixto: float = 0.5) -> np.ndarray:
+    """Genera `n` duraciones para `especialidad`. Si no hay `datos_empiricos`
+    (o no hay ninguna observacion de esa especialidad en ellos), siempre usa
+    la Gamma global calibrada para Chile. Si SI hay observaciones propias
+    para esa especialidad, el comportamiento depende de `modo_duracion_propia`:
+
+      - "bootstrap" (Opcion 1: "los tiempos que estan"): remuestrea SIEMPRE
+        con reemplazo desde las duraciones observadas para esa especialidad,
+        sin importar cuantas observaciones haya (mientras haya al menos una).
+        Nunca inventa una duracion que no este en los datos.
+      - "bootstrap_gamma" (Opcion 2: "los tiempos que estan" + variacion
+        gamma): cada cirugia generada tiene probabilidad
+        `prop_gamma_en_mixto` de salir de una Gamma ajustada a la media/sd
+        PROPIA de esa especialidad (ver _ajustar_gamma_por_especialidad,
+        redondeada al multiplo de 5 mas cercano), y probabilidad
+        `1 - prop_gamma_en_mixto` de salir del bootstrap de los datos reales
+        (como en el modo "bootstrap"). Esto agrega variabilidad continua
+        alrededor de la distribucion observada, en vez de limitarse a repetir
+        exactamente los valores ya vistos.
+      - "auto" (compatibilidad hacia atras): bootstrap si hay al menos
+        `minimo_bootstrap` observaciones para esa especialidad; si no, Gamma
+        global (comportamiento original, previo a estos dos modos).
+
+    Si el modo pide bootstrap pero la especialidad no tiene NINGUNA
+    observacion propia, se avisa con un warning y se usa la Gamma global para
+    esa especialidad puntual (no puede haber bootstrap sin datos)."""
+    pool = None
     if datos_empiricos is not None and especialidad is not None:
         pool = datos_empiricos.loc[datos_empiricos["Especialidad"] == especialidad, "Duracion"].to_numpy()
-        if len(pool) >= minimo_bootstrap:
+        if len(pool) == 0:
+            pool = None
+
+    if pool is not None:
+        if modo_duracion_propia == "bootstrap":
             return rng.choice(pool, size=n, replace=True).astype(int)
+
+        if modo_duracion_propia == "bootstrap_gamma":
+            es_gamma = rng.random(n) < prop_gamma_en_mixto
+            salida = rng.choice(pool, size=n, replace=True).astype(float)
+            n_gamma = int(es_gamma.sum())
+            if n_gamma > 0:
+                shape, scale = _ajustar_gamma_por_especialidad(datos_empiricos, especialidad)
+                d = rng.gamma(shape, scale, size=n_gamma)
+                d = np.clip(d, DURATION_MIN, DURATION_MAX)
+                salida[es_gamma] = np.round(d / 5) * 5
+            return salida.astype(int)
+
+        if modo_duracion_propia == "auto" and len(pool) >= minimo_bootstrap:
+            return rng.choice(pool, size=n, replace=True).astype(int)
+
+    elif datos_empiricos is not None and especialidad is not None \
+            and modo_duracion_propia in ("bootstrap", "bootstrap_gamma"):
+        warnings.warn(
+            f"La especialidad '{especialidad}' no tiene ninguna observacion en "
+            "datos_cirugias_propios; no se puede generar duraciones con "
+            f"modo_duracion_propia='{modo_duracion_propia}' para ella. Se usa "
+            "la Gamma global por defecto solo para esta especialidad.",
+            UserWarning, stacklevel=2,
+        )
+
     d = rng.gamma(_DUR_SHAPE, _DUR_SCALE, size=n)
     d = np.clip(d, DURATION_MIN, DURATION_MAX)
     return (np.round(d / 5) * 5).astype(int)  # redondeo a multiplos de 5 min
@@ -157,15 +239,21 @@ def generar_pabellones(n_pabellones: int, rng: np.random.Generator,
 
 def generar_cirugias(tabla_pabellones: pd.DataFrame, rng: np.random.Generator,
                       factor_sobredemanda: float = 1.5,
-                      datos_empiricos: pd.DataFrame = None) -> pd.DataFrame:
+                      datos_empiricos: pd.DataFrame = None,
+                      modo_duracion_propia: str = "auto",
+                      prop_gamma_en_mixto: float = 0.5) -> pd.DataFrame:
     """Genera cirugias candidatas POR ESPECIALIDAD hasta que la duracion total
     candidata alcance factor_sobredemanda veces la capacidad de los pabellones
     de esa especialidad ese dia (para que el problema sea de seleccion real,
     no una asignacion trivial 1 a 1).
 
     Si se entrega `datos_empiricos` (ver cargar_datos_cirugias), las
-    duraciones de cada especialidad se remuestrean desde esos datos reales
-    en vez de la distribucion Gamma por defecto."""
+    duraciones de cada especialidad se generan segun `modo_duracion_propia`
+    (ver _muestrear_duraciones): "bootstrap" (solo los tiempos observados),
+    "bootstrap_gamma" (tiempos observados + variacion gamma propia de la
+    especialidad, mezclados segun `prop_gamma_en_mixto`), o "auto"
+    (comportamiento original: bootstrap si hay >= 5 observaciones, si no
+    Gamma global)."""
     registros = []
     id_counter = 1
     for especialidad, grupo in tabla_pabellones.groupby("Especialidad"):
@@ -175,7 +263,9 @@ def generar_cirugias(tabla_pabellones: pd.DataFrame, rng: np.random.Generator,
         tope_cirugias = 2000
         while duracion_acumulada < objetivo_duracion and id_counter <= tope_cirugias:
             d = int(_muestrear_duraciones(1, rng, especialidad=especialidad,
-                                           datos_empiricos=datos_empiricos)[0])
+                                           datos_empiricos=datos_empiricos,
+                                           modo_duracion_propia=modo_duracion_propia,
+                                           prop_gamma_en_mixto=prop_gamma_en_mixto)[0])
             registros.append({"ID_IQ": id_counter, "Especialidad": especialidad, "Tiempo": d})
             duracion_acumulada += d
             id_counter += 1
@@ -262,27 +352,85 @@ def generar_instancia(n_pabellones: int, seed: int = None,
                        cobertura_minima: float = 0.8,
                        max_medicos_extra_por_especialidad: int = 8,
                        pesos_especialidad: dict = None,
-                       datos_cirugias_propios=None) -> dict:
+                       datos_cirugias_propios=None,
+                       usar_mezcla_de_datos_propios: bool = True,
+                       modo_duracion_propia: str = "bootstrap",
+                       prop_gamma_en_mixto: float = 0.5) -> dict:
     """Si `pesos_especialidad` es None, se usan los pesos por defecto
-    (calibrados para Chile, ver README). Si se entrega un dict propio (por
-    ejemplo, generado con pesos_especialidad_desde_datos), tanto la mezcla de
-    pabellones como el pool de medicos usan esas especialidades y pesos en
-    vez de los seis por defecto.
+    (calibrados para Chile, ver README) - A MENOS que se entregue
+    `datos_cirugias_propios`, en cuyo caso (por defecto,
+    usar_mezcla_de_datos_propios=True) los pesos se derivan automaticamente
+    de la frecuencia observada en esos datos (equivalente a llamar
+    pesos_especialidad_desde_datos). Esto es porque la lista de cirugias que
+    alguien entrega ya es, en si misma, la distribucion a priori que tiene
+    esa persona/hospital: si no se dice lo contrario, se asume que esa es la
+    mezcla que se quiere reproducir. Pasa usar_mezcla_de_datos_propios=False
+    para mantener la mezcla chilena por defecto aunque se entreguen datos
+    propios.
+
+    Si se entrega un `pesos_especialidad` EXPLICITO (propio o por defecto)
+    junto con `datos_cirugias_propios` -por ejemplo, para fijar una mezcla
+    objetivo distinta a la mezcla observada en los datos-, ambos deben usar
+    las mismas etiquetas de especialidad para que el bootstrap de duraciones
+    funcione: si ninguna especialidad de `pesos_especialidad` tiene
+    observaciones en `datos_cirugias_propios`, se emite un warning (en vez de
+    caer en silencio a la Gamma por defecto para todas las especialidades).
 
     `datos_cirugias_propios` acepta un DataFrame ya cargado con
     cargar_datos_cirugias, o directamente un path a .csv/.xlsx con columnas
-    'Especialidad' y 'Duracion': si se entrega, las duraciones se
-    remuestrean desde esos datos reales en vez de la distribucion Gamma
-    calibrada para Chile."""
+    'Especialidad' y 'Duracion' (o 'Tiempo'). Cuando se entrega, cada
+    especialidad puede tener cirugias de distintos tiempos, y esa
+    distribucion propia (dada por la lista de cirugias) se usa segun
+    `modo_duracion_propia`:
+
+      - "bootstrap" (default, Opcion 1): las cirugias generadas usan
+        exclusivamente los tiempos que estan en tus datos para esa
+        especialidad (remuestreo con reemplazo). Nunca inventa una duracion
+        fuera de lo observado.
+      - "bootstrap_gamma" (Opcion 2): ademas de generar cirugias con los
+        tiempos que estan, agrega cirugias con duraciones muestreadas de una
+        Gamma ajustada a la media/sd PROPIA de esa especialidad (no la Gamma
+        global chilena), redondeadas al multiplo de 5 mas cercano. La
+        fraccion de cirugias que sale de la Gamma en vez del bootstrap la
+        fija `prop_gamma_en_mixto` (0.5 = mitad y mitad).
+
+    En ambos modos, si una especialidad no tiene ninguna observacion propia
+    (p.ej. porque diste un `pesos_especialidad` con etiquetas que no calzan
+    con tus datos), se avisa con un warning y esa especialidad puntual usa la
+    Gamma global chilena. Pasa `modo_duracion_propia="auto"` para el
+    comportamiento previo a estos dos modos (bootstrap solo si hay >= 5
+    observaciones, si no Gamma global)."""
     rng = np.random.default_rng(seed)
-    pesos = pesos_especialidad or SPECIALTY_WEIGHTS
 
     if datos_cirugias_propios is not None and not isinstance(datos_cirugias_propios, pd.DataFrame):
         datos_cirugias_propios = cargar_datos_cirugias(datos_cirugias_propios)
 
+    if pesos_especialidad is not None:
+        pesos = pesos_especialidad
+        if datos_cirugias_propios is not None:
+            especialidades_datos = set(datos_cirugias_propios["Especialidad"].unique())
+            if not (set(pesos.keys()) & especialidades_datos):
+                warnings.warn(
+                    "Ninguna especialidad de 'pesos_especialidad' "
+                    f"({sorted(pesos.keys())}) aparece en 'datos_cirugias_propios' "
+                    f"(etiquetas presentes: {sorted(especialidades_datos)}). El "
+                    "bootstrap de duraciones no encontrara observaciones para "
+                    "ninguna especialidad y usara la distribucion Gamma por "
+                    "defecto para todas, ignorando los datos reales. Revisa que "
+                    "las etiquetas coincidan, o deja pesos_especialidad=None para "
+                    "derivar los pesos automaticamente desde tus datos.",
+                    UserWarning, stacklevel=2,
+                )
+    elif datos_cirugias_propios is not None and usar_mezcla_de_datos_propios:
+        pesos = pesos_especialidad_desde_datos(datos_cirugias_propios)
+    else:
+        pesos = SPECIALTY_WEIGHTS
+
     tabla_pabellones = generar_pabellones(n_pabellones, rng, pesos_especialidad=pesos)
     tabla_cirugias = generar_cirugias(tabla_pabellones, rng, factor_sobredemanda=factor_sobredemanda,
-                                       datos_empiricos=datos_cirugias_propios)
+                                       datos_empiricos=datos_cirugias_propios,
+                                       modo_duracion_propia=modo_duracion_propia,
+                                       prop_gamma_en_mixto=prop_gamma_en_mixto)
 
     n_medicos_base = max(len(pesos), round(n_pabellones * medicos_por_pabellon))
     tabla_medicos, reporte_cobertura = generar_medicos(

@@ -155,33 +155,54 @@ hospital, country, or specialty mix), you can plug them in directly instead
 of relying on the built-in calibration:
 
 ```python
-from generar_instancia import (
-    generar_instancia, cargar_datos_cirugias, pesos_especialidad_desde_datos,
-)
+from generar_instancia import generar_instancia
 
-# Your own data: a CSV/xlsx with columns 'Especialidad' and 'Duracion' (minutes),
-# one row per observed surgery. See plantilla_datos_propios.csv for the format.
-mis_datos = cargar_datos_cirugias("mis_cirugias.csv")
-mis_pesos = pesos_especialidad_desde_datos(mis_datos)
-
+# Your own data: a CSV/xlsx with columns 'Especialidad' and 'Duracion' (minutes)
+# — 'Tiempo' is also accepted as the duration column name — one row per
+# observed surgery. See plantilla_datos_propios.csv for the format.
 instancia = generar_instancia(
     n_pabellones=10,
-    pesos_especialidad=mis_pesos,        # replaces the Chile-calibrated specialty mix
-    datos_cirugias_propios=mis_datos,    # durations are bootstrapped from your real data
+    datos_cirugias_propios="mis_cirugias.csv",
 )
 ```
 
 Behaviour:
 
-- `pesos_especialidad_desde_datos` derives specialty weights (for both rooms
-  and surgeons) from the frequency of each specialty in your data — your own
-  specialty names are used as-is, they do not need to match the six
-  Chile-specific categories.
-- `datos_cirugias_propios` makes `generar_cirugias` **bootstrap durations
-  directly from your data**, per specialty, instead of the default Gamma
-  distribution. If a specialty in your data has fewer than 5 observations,
-  the generator falls back to the default Gamma distribution for that
-  specialty only (too few points to bootstrap meaningfully).
+- Passing a surgery-level list is already handing the generator your own
+  prior: **by default, the specialty mix (for both rooms and surgeons) is
+  derived automatically from the frequency of each specialty in
+  `datos_cirugias_propios`** — your own specialty names/codes are used as-is,
+  they do not need to match the six Chile-specific categories. This is what
+  `pesos_especialidad_desde_datos` does under the hood; you no longer need
+  to call it yourself.
+- `datos_cirugias_propios` also changes how `generar_cirugias` produces
+  durations, per specialty, controlled by `modo_duracion_propia`:
+    - `"bootstrap"` (default): candidate surgeries only ever use durations
+      that appear in your data for that specialty (resampled with
+      replacement). It never invents a duration outside what you observed.
+    - `"bootstrap_gamma"`: on top of the durations that are there, it also
+      adds surgeries with durations drawn from a Gamma distribution fitted
+      (by moment matching) to that specialty's *own* observed mean/sd —
+      not the Chile-wide default — rounded to the nearest 5 minutes. The
+      split between "observed" and "gamma" surgeries is controlled by
+      `prop_gamma_en_mixto` (default 0.5). This is useful when a specialty
+      only has a handful of distinct observed durations and you want more
+      continuous variation around that distribution rather than exact
+      repeats.
+    - `"auto"` (previous behaviour): bootstrap if the specialty has at least
+      5 observations, otherwise the Chile-wide default Gamma.
+  If a specialty has zero observations in your data, the generator warns and
+  falls back to the Chile-wide default Gamma for that specialty only.
+- If you want to *keep* the default Chile-calibrated mix while still
+  bootstrapping durations from your data (or impose some other target mix),
+  pass `pesos_especialidad` explicitly — but then its keys must match the
+  `Especialidad` labels used in `datos_cirugias_propios`, or the bootstrap
+  will never find a matching pool and will silently fall back to the Gamma
+  distribution for every specialty. The generator checks for this and raises
+  a `UserWarning` if `pesos_especialidad` and `datos_cirugias_propios` share
+  no specialty labels at all. Pass `usar_mezcla_de_datos_propios=False` to
+  explicitly opt out of the auto-derived mix and fall back to the
+  Chile-calibrated weights even when `datos_cirugias_propios` is given.
 - Room-count tiers, block-time structure (full-day/half-day), oversupply
   factor, and coverage-reinforcement logic are unaffected — they apply
   regardless of which specialty mix or duration data you use.
