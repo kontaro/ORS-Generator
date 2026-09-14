@@ -207,10 +207,85 @@ Behaviour:
   factor, and coverage-reinforcement logic are unaffected — they apply
   regardless of which specialty mix or duration data you use.
 
+## Editing the generated files by hand
+
+Instead of (or in addition to) changing generation parameters, you can start
+from the three `.xlsx` files already produced for an instance and edit them
+directly — e.g., to add/remove surgeons or surgeries by hand. To keep the
+instance internally consistent with the rest of the generator's assumptions:
+
+**Adding or removing surgeons (`*_Medicos.xlsx`)**
+
+- Columns: `Medico_ID` (unique integer), `Especialidad`, `Inicio`, `Fin`
+  (minutes since midnight).
+- `Especialidad` must match one of the specialties actually present in that
+  same instance's `*_Pabellones.xlsx`. Each room is restricted to one
+  specialty per day, and each surgery can only be done by a surgeon of the
+  matching specialty, so a surgeon with a specialty that has no room that
+  day can never be assigned to anything.
+- Keep `Inicio`/`Fin` within the 08:00–17:00 working day (480–1020 in
+  minutes) and, if you want to preserve the block-scheduling assumption this
+  generator is built on (see Assumption 4), pick one of the three standard
+  blocks rather than an arbitrary window: full day (480–1020), AM half-day
+  (480–750), or PM half-day (750–1020).
+- The instance was generated to reach a *minimum* coverage
+  (`cobertura_minima`, 80% of the day by default) per active specialty —
+  that's a floor, not a ceiling. Adding surgeons only increases coverage, so
+  it's always safe; removing surgeons can drop a specialty's coverage
+  below what the candidate surgeries of that specialty actually need,
+  making some of them impossible to schedule at all rather than just
+  harder to fit in.
+
+**Adding or removing surgeries (`*_Cirugias.xlsx`)**
+
+- Columns: `ID_IQ` (unique integer), `Especialidad`, `Tiempo` (minutes).
+- `Especialidad` must again match a specialty present in that instance's
+  `*_Pabellones.xlsx`, or the added surgery can never be assigned to any
+  room.
+- If you want added rows to look like the rest of the data, keep `Tiempo`
+  within the same clinically-plausible range used elsewhere (45–400
+  minutes) and rounded to the nearest 5 minutes.
+- The instance was generated so that each specialty's total candidate
+  surgery-minutes equal `factor_sobredemanda` (1.5× by default) times that
+  specialty's total room-minutes for the day — this oversupply is what
+  makes the scheduling problem a real selection problem rather than a
+  trivial assignment (see Assumption 7). Adding or removing surgeries by
+  hand changes that ratio for the specialties you touch; worth deciding
+  whether you want to preserve it (for comparable difficulty across
+  instances) or deliberately move it to see how each model degrades as the
+  backlog grows or shrinks.
+
 ## Reproducibility
 
 All randomness is controlled via a single `seed` argument (NumPy
-`Generator`), so instances are fully reproducible.
+`Generator`). If you don't pass one, the generator draws a concrete seed
+itself instead of leaving the run unseeded — so an instance is always
+reproducible, even if you forgot to set a seed.
+
+`generar_instancia` returns an `instancia["metadata"]` dict with every
+parameter needed to reproduce that exact instance (seed, room count,
+oversupply factor, the specialty weights actually used, duration mode,
+etc.). `guardar_instancia` writes this alongside the three `.xlsx` files as
+`{prefijo}_metadata.json`, and `regenerar_desde_metadata(ruta_metadata)`
+rebuilds the identical instance from that file alone:
+
+```python
+from generar_instancia import generar_instancia, guardar_instancia, regenerar_desde_metadata
+from pathlib import Path
+
+instancia = generar_instancia(n_pabellones=12, factor_sobredemanda=1.5)  # no seed passed
+guardar_instancia(instancia, Path("instancias"), prefijo="12_pab")
+
+# Later, from just the saved files:
+misma_instancia = regenerar_desde_metadata("instancias/12_pab_metadata.json")
+```
+
+If `datos_cirugias_propios` was passed as an in-memory DataFrame (rather
+than a file path), the metadata only stores a summary (row count, specialty
+labels) — not the raw durations, to avoid ever embedding real surgery data
+in a versioned `.json` artifact. In that case, reproduce the instance by
+calling `generar_instancia` directly with the same DataFrame and the other
+parameters listed in the metadata.
 
 ## Citation
 
